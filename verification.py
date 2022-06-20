@@ -1,33 +1,33 @@
-
-import datetime as dt
-from dateutil.relativedelta import relativedelta
-from matplotlib import ticker
-import matplotlib.pyplot as plt
+import CRPS.CRPS
 import numpy as np
-import os
 import pandas as pd
-import pytz
-from sklearn import metrics
+from dateutil.relativedelta import relativedelta
+import datetime as dt
 import yaml
+from sklearn import metrics
+import matplotlib.pyplot as plt
+from matplotlib import ticker
+import datetime as dt
+import pytz
+import os
+import sys
+from pythonlib.odw import call_odw_df
+from pythonlib.hydro_ops import get_nhmm_natflow, get_usace
+from pythonlib.error_email import error_email
 
-#User defined modules
-from odw import call_odw_df
-from hydro_ops import get_nhmm_natflow, get_usace
-from error_email import error_email
-
-#Basic Steps Performed to Validate a Forecast:
-# 1. Get observed data
-# 2. Get forecast data
-# 3. Make climatology (seasonal forecasts) or persistence (short-term forecasts) as baseline forecasts
+#Basic Steps:
+# 1. Get obs
+# 2. Get forecasts
+# 3. Make climo (baseline forecast)
 # 4. For each source, split forecasts into different horizons
-# 5. For each source and horizon, align forecasts with observations
+# 5. For each source and horizon, align forecasts with obs
 # 6. Calculate deterministic stats (raw and skill scores)
-# 7. Plot deterministic performance stats by horizon
-# 8. Calculate probabilistic performance stats (CRPS and CRPSS) #TODO
+# 7. Plot determinisitc performance stats by horizon
+# 8. Palculate probabilistic stats (FRPSS)
 # 9. Plot Q-Q and stats by horizon #TODO
 
 #Requires pythonlib repo containing odw, hydro_ops, error_email modules to be located in the same directory, or in the user's PATH.
-# Also requires access to SCL Oracle data warehouse where historical forecasts are archived. 
+# Also requires access to Oracle data warehouse where historical forecasts are archived.
 
 class Verification:
     def __init__(self, sitename, horizontype, sd, ed, inc='M', obsthresh=0.7, snow_survey=False, bymonth=False, localtz='US/Pacific'):
@@ -94,6 +94,7 @@ class Verification:
         except Exception as e:
             print(e)
             pass
+        print("set fxstart to {}".format(self.fxstart.strftime("%Y%m%d %H:%M:%S %z")))
 
         #Save (or update) the latest forecast end date in the verification
         try:
@@ -143,8 +144,6 @@ class Verification:
             'MM': 1, 'MQ': 3
         }
         print("**Adding obs for {}".format(self.site))
-
-        #Retrieve observed data for the forecast site and add it to the verification object.
         obs, samp = get_obs_wrapper(self.sd, self.ed, sitename=self.site)
         #Resample the obs data from their native temporal resolution to the resolution of the
         # verification object, dropping any intervals that have an insufficient data counts.
@@ -172,7 +171,7 @@ class Forecast:
         Forecast object definition. Forecasts for a given site and from a specified source (e.g. RFC,
         private vendor) may be added to the forecast verification object for that site.
         Parameters:
-        - fxsource: Forecast source name. Currently supported: rfc, upstream, vendor1, snow survey
+        - fxsource: Forecast source name. Currently supported forecast sources must have entries in forecast YAML file in same directory.
         - horizontype: Type of forecast; short-term or seasonal.
         - sd: Requested start date of forecast valid times (datetime object)
         - ed: Requested end date of forecast valid times (datetime object)
@@ -253,7 +252,7 @@ def get_scl_obs(db, table, sitename, sitecode, sd=None, ed=None, lastx=None, dtn
     - lastx: Most recent number of days (relative to end date to perform verification). Default: None.
        If none specified, set equal to 30 days.
     - dtname: Column name in the database in which date / datetime is stored.
-    - localtz: Time zone local to the site. Most sites' data used at SCL are in Pacific Time (default).
+    - localtz: Time zone local to the site (Pacific Time is database native default).
     - converttz: Time zone to convert to, if site's local time (localtz) is something other than the
        time zone to be evalutated. Default: None.
     '''
@@ -268,7 +267,7 @@ def get_scl_obs(db, table, sitename, sitecode, sd=None, ed=None, lastx=None, dtn
         "and '{ed}' and b1='{b1}' and elem = '{elem}' order by {dttm}"\
         "".format(dttm=dtname, db=db, tb=table, sd=sd.strftime("%Y-%m-%d"), ed=ed.strftime("%Y-%m-%d"),
             b1=sitecode, elem='Nat Flow')
-
+    print(obs_q)
     obs = call_odw_df(obs_q, index_col=dtname.upper(), parse_dates=True)
     obs.rename({'VALUE': sitename}, axis=1, inplace=True)
     #make obs tz-aware if they aren't already
@@ -291,8 +290,8 @@ def get_fx(sitename, fxsource='rfc', horizontype='seasonal', fx_type='determinis
     Parameters:
     - sitename: Name of site. Site metadata must be defined in forecast_metadata.yaml in order to be
        supported. (Required; no default)
-    - fxsource: indicates the original source of the forecast. Currently supported: rfc (default),
-       upstream, vendor1, snow survey
+    - fxsource: indicates the original source of the forecast. Currently supported forecasts must have
+       entries in forecast YAML file in same directory.
     - horizontype: type of forecast. Currently supported: short-term, seasonal (default)
     - fx_type: deterministic (default) or probabilistic; any value starting with a D or d is interpreted
        as 'deterministic' and any value starting with a P or p is interpreted as probabilisitc.
@@ -303,7 +302,7 @@ def get_fx(sitename, fxsource='rfc', horizontype='seasonal', fx_type='determinis
     - ed: End date for verification. Default: None. If None specified, set equal to the current date.
     - lastx: Most recent number of days (relative to end date to perform verification). Default: None.
        If none specified, set equal to 30 days.
-    - localtz: Time zone local to the site. Most sites' data used at SCL are in Pacific Time (default).
+    - localtz: Time zone local to the site (Pacific Time is database native default).
     - converttz: Time zone to convert to, if site's local time (localtz) is something other than the
        time zone to be evalutated. Default: None.
     - inc: Time increment for forecast evaluation. Default: 'M' (monthly)
@@ -477,6 +476,7 @@ def make_climo_fx(vx, climo_sd=None, climo_ed=None, extended_hist=False, localtz
         try:
             climo_fx = climo_fx[(climo_fx.index <= vx.fxend.tz_localize(localtz)) & (climo_fx.index >= vx.fxstart.tz_localize(localtz))]
         except:
+            print("vx.fxstart and/or vx.fxend are already tzaware")
             pass
     climo_fx.reset_index(inplace=True)
     climo_fx.rename({'index': 'validtime'}, axis=1, inplace=True)
@@ -552,7 +552,7 @@ def get_obs_wrapper(sd, ed, sitename="Ross"):
     Parameters:
     - sd: Start date. Required, no default.
     - ed: End date. Required, no default.
-    - sitename: Site to retrieve obs data for. Default: 'Ross'. 
+    - sitename: Site to retrieve obs data for (doubles as price block for price forecast validation; options are 'onpeak', 'offpeak', or 'all'). Default: 'Ross'.
     '''
     #NOTE: do not resample in this function; data are QC'ed then resampled in add_obs
     #Retrieve database parameters ("metadata") from obs_metadata.yaml via the get_obs_meta method.
@@ -565,11 +565,24 @@ def get_obs_wrapper(sd, ed, sitename="Ross"):
         if sitename=='Newhalem' or sitename=='Marblemount':
             get_skagit = False
             obs = get_nhmm_natflow(sd=sd+dt.timedelta(hours=1), ed=ed, get_skagit=get_skagit)
+        else:
+            print("ERROR: Unrecognized USGS site!")
     elif obs_src == 'usace':
         #TODO: allow datastream to be inflow or outflow
         obs = get_usace(station=meta[obs_src]['sites'][sitename], sd=sd, ed=ed, datastream='inflow', per='D')
         obs.rename({'station': sitename}, inplace=True, axis=1)
         samp = 'D'
+    elif obs_src == 'dow_jones':
+        samp='D'
+        hub = meta[obs_src]['sites'][hub]
+        if sitename not in ['onpeak', 'offpeak', 'all']:
+            sitename = 'all'
+        price_block = meta[obs_src]['block'][sitename]
+        schema = meta[obs_src]['schema']
+        table = meta[obs_src]['table']
+        valid = meta[obs_src]['valid']
+        obs_q = f"select {valid}, {price_block} from {schema}.{table} where hub_name = {hub} order by {valid}"
+        obs = call_odw_df(obs_q, index_col='VALIDTIME', parse_dates=True)
     else:
         print("ERROR: Unrecognized site / data source!")
         raise
@@ -610,7 +623,7 @@ def calc_det_stats(o, f, c=pd.DataFrame()):
     return [mae, rmse, bias]
 
 
-def calc_fx_stats(vx, norm=True, writedata=True, write_dest=None, calc_climo=False, plotstats=True, eval_months=None):
+def calc_fx_stats(vx, norm=True, writedata=True, write_dest=None, calc_climo=False, plotstats=True, eval_months=None, determ=True):
     '''
     Wrapper function to calculate forecast performance errors (or skill scores), which are saved in the
     forecast object attribute stats dictionary. The stats attribute is a dictionary with two keys: 'raw' and 'norm'.
@@ -688,7 +701,8 @@ def calc_fx_stats(vx, norm=True, writedata=True, write_dest=None, calc_climo=Fal
             fxd = fxo.get_fx_data().copy()
             if bymonth:
                 fxd = fxd[fxd.validtime.dt.month==m]
-
+                print(len(fxd))
+                
             print("Validating {} to {}".format(min(fxd.validtime).strftime("%Y%m%d"), max(fxd.validtime).strftime("%Y%m%d")))
             raw_stats_names = ['MAE_', 'RMSE_', 'Bias_']
             cols = ["horizon"]+[s+fxo.source for s in raw_stats_names]
@@ -697,10 +711,13 @@ def calc_fx_stats(vx, norm=True, writedata=True, write_dest=None, calc_climo=Fal
             hzs = [h for h in hzs if h>0]
             if snow_survey:
                 hzs = [h for h in hzs if h<=vx.max_h]
+
             #Calculate stats for the forecast object
             fx_stats_holder=[[np.nan, np.nan, np.nan]]*len(hzs)
             for i in range(len(hzs)):
+                #TODO: break this into its own function
                 if hzs[i] > 0 and hzs[i] in fxd.horizon.tolist() and hzs[i] <= 12:
+                    #TODO: forecast horizons greater than 12 should be allowed for short-term forecasts
                     fxvx = fxd[fxd.horizon==hzs[i]].copy()
                     if snow_survey:
                         fxvx = fxvx[(fxvx.validtime.dt.month < 10) & (fxvx.validtime.dt.month > fxvx.horizon)]
@@ -719,14 +736,20 @@ def calc_fx_stats(vx, norm=True, writedata=True, write_dest=None, calc_climo=Fal
                         continue
 
                     dat_names = testdata.columns.tolist()
-                    #TODO: this will definitely not work for probabilistic
-                    print("Calculating deterministic stats for source {} for horizon {}".format(fxo.source, hzs[i]))
+                    print("Calculating stats for source {} and horizon {}".format(fxo.source, hzs[i]))
 
                     if norm:
-                        ch = c[m][c[m].index==hzs[i]].copy()
+                        ch = c[m][c[m].index==hzs[i]].copy() #Climo for given month group and horizon
                     else:
                         ch = None
-                    fx_stats_holder[i] = [hzs[i]]+calc_det_stats(testdata[dat_names[0]], testdata[dat_names[2]], ch)
+                    if determ:
+                        fx_stats_holder[i] = [hzs[i]]+calc_det_stats(testdata[dat_names[0]], testdata[dat_names[2]], ch)
+                    else: #probabilistic uses the Fair Continuous Rank Probability Score (see github.com/garovent/CRPS for ref)
+                        crps, fcrps, acrps = CRPS(testdata[dat_names[2], testdata[dat_names[0]]]).compute()
+                        if norm:
+                            fcrps = fcrps/ch
+                        fx_stats_holder[i] = [hzs[i]]+fcrps
+                        #TODO: further testing
             fs = pd.DataFrame(fx_stats_holder, index=None, columns=cols)
             fs.dropna(inplace=True)
             fs = fs.set_index("horizon")
@@ -824,8 +847,9 @@ def plot_fx_stats(vx, norm=True, plot_dest=None, plot_name=None, mons=0):
 def ross_vx(sd, ed):    
     seas_det = Verification(sitename='Ross', horizontype='seasonal', ed=ed, sd=sd, inc='M', bymonth=False)
     #seas_det.add_forecast(source='snow survey')
-    seas_det.add_forecast(source='vendor1')
+    seas_det.add_forecast(source='vendor 1')
     seas_det.add_forecast(source='rfc esp')
+    #seas_det.add_forecast(source='upstream')
     seas_det.add_obs()
     seas_det.add_climo()
     calc_fx_stats(seas_det)
